@@ -1,0 +1,472 @@
+import numpy
+import FinanceDataReader as fdr
+import pandas as pd
+import yfinance as yf
+import time
+import ta
+import numpy as np
+from selenium.webdriver.common.keys import Keys # 스크롤
+from urllib.request import urlopen
+from distutils.log import info
+from types import new_class
+from pydoc import describe
+from pandas import DataFrame
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from bs4 import BeautifulSoup
+from webdriver_manager.chrome import ChromeDriverManager #크롬 드라이버 자동 업데이트
+from datetime import datetime #날짜
+from fredapi import Fred #버핏 지수 필요 라이브러리
+from datetime import date, timedelta, datetime #날짜
+from sklearn.preprocessing import MinMaxScaler
+
+# rsi가 30보다 낮으면 과매도 구간, 70보다 높으면 과매수 기간임.
+# 매수 점수기준으로 score 결정함.
+def get_rsi_score(x):
+    if x <= 30:
+        return 100
+    elif x <= 35:
+        return 90
+    elif x <= 40:
+        return 85
+    elif x <= 45:
+        return 80
+    elif x <= 50:
+        return 75
+    elif x <= 55:
+        return 70
+    elif x <= 60:
+        return 65
+    elif x <= 65:
+        return 50
+    elif x <= 70:
+        return 45
+    elif x <= 75:
+        return 40
+    elif x <= 80:
+        return 35
+    elif x <= 85:
+        return 30
+    else:
+        return 0
+#cmf         
+def get_cmf_score(avg_60, volume, cmf, rsi):
+    if (avg_60 >= 100.0) & (volume >= 100000):
+        if (cmf <= 0) & (rsi <=45):
+            return 0
+        elif (cmf <= 0) & (rsi <= 47):
+            return 20
+        elif (cmf <= 0) & (rsi <= 49):
+            return 30
+        elif (cmf <= 0) & (rsi <= 50):
+            return 40
+        elif (cmf <=0) & (rsi <= 55):
+            return 50
+        elif (cmf >=0) & (rsi >= 50):
+            return 100
+        else:
+            return 50
+    else:
+        return 0
+#macd
+def get_macd_score(macd, cmf):
+    if (macd >= 2) & (cmf >= 0):
+        return 100
+    elif (macd >= 1.7) & (cmf >= 0):
+        return 95
+    elif (macd >= 1.4) & (cmf >= 0):
+        return 85
+    elif (macd >= 1.0) & (cmf >= 0):
+        return 70
+    elif (macd >= 0.7) & (cmf >= 0):
+        return 55
+    elif (macd >= 0.4) & (cmf >= 0):
+        return 40
+    elif (macd < 0) & (cmf < 0):
+        return 20
+    else:
+        return 0
+#cci
+def get_cci_score(x):
+    if x <= 0:
+        return 0
+    elif x <= 40:
+        return 20
+    elif x <= 55:
+        return 40
+    elif x <= 70:
+        return 60
+    elif x <= 85:
+        return 80
+    elif x <= 100:
+        return 90
+    else:
+        return 100
+#atr
+def get_atr_score(x):
+    if x == 0:
+        return 100
+    else:
+        return 0
+# word
+def get_word_score(x):
+    if x >=100:
+        return 10
+    elif x >= 80:
+        return 8
+    elif x >= 60:
+        return 6
+    elif x >= 40:
+        return 4
+    elif x >= 20:
+        return 2
+    else:
+        return 0
+#buffett
+def get_buffett_indicator(x):
+    if (x>=57) & (x<=74):
+        return 5
+    elif (x>=75) & (x<=90):
+        return 3
+    elif (x>=91) & (x<=107):
+        return 1
+    elif (x>107):
+        return 0
+
+BUY = ['Outperform', 'Overweight', 'Buy', 'Strong Buy', 'Moderate Buy', 'Accumlate']
+HOLD = ['Equal-Weight', 'Neutral', 'Marketperform', 'Industryperform', 'Sectorperform', 'Peerperform']
+SELL = ['Underperform', 'Underweight', 'Moderate Sell', 'Unload', 'Weak Hold']
+
+posWord = pd.read_csv('C:/Users/tjtjd/Desktop/helpant/data/posWord.csv') #긍정사잔
+negWord = pd.read_csv('C:/Users/tjtjd/Desktop/helpant/data/negWord.csv') #부정사전
+
+good_word = [] #긍정뉴스
+for i in range(len(posWord)):
+    good_word.append(posWord['SynsetTerms'].values[i])
+bad_word = [] #부정뉴스
+for i in range(len(negWord)):
+    bad_word.append(negWord['SynsetTerms'].values[i])
+
+url = 'https://finance.yahoo.com/' #야후 파이낸스 (크롤러 대상) URL
+
+#브라우저 꺼짐 방지
+chrome_options = webdriver.ChromeOptions()
+chrome_options.add_argument('headless') #빽그라운드에서 진행
+chrome_options.add_argument("disable-gpu") #gpu사용 최소
+chrome_options.add_argument("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.60 Safari/537.36")
+chrome_options.add_experimental_option("detach", True)
+
+#불필요한 에러 메시지 없애기
+chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
+service = Service(executable_path=ChromeDriverManager().install())
+
+#크롬 창 드라이버
+driver = webdriver.Chrome(service=service, options=chrome_options)
+
+#파이썬 fdr라이브러리에서 나스닥 불러오기
+stock = fdr.StockListing(market = 'NASDAQ')            #나스닥 전체 불러오기
+industrial_indicator = stock #산업 구분
+stock = stock.head(50)
+
+#데이터 프레임 형태로 만들어서 티커(주식 문자)만 꺼내오기
+stock = pd.DataFrame(stock, columns=['Symbol'])
+stock = stock.values.tolist()
+#stock = stock[87:152]
+
+def listToString(str_list):                             #리스트를 문자열로 변환
+    result = ""
+    for s in str_list:
+        result += s + " "
+    return result.strip()
+
+order = 0 #저장컬럼 순서
+anlysit_count = 0  #분석가 카운터
+pn_count = 0 #긍정부정 카운터
+industrial_count = 0 # 산업구분 카운터
+
+#positive_rate csv파일
+columns = ['date', 'ticker', 'price', 'marketCap', 'indices', 'rsi', 'avg_60', 'volume', 'cmf', 'macd', 'cci', 'atr',
+        'good_words_count', 'bad_words_count', 'positive_rate',' BUY', 'HOLD', 'SELL']
+df_total = pd.DataFrame(columns=columns) 
+
+#애널리스트 csv파일
+columns_anl = ['date', 'ticker', 'suggest_type', 'suggest_value']
+anylist_total = pd.DataFrame(columns=columns_anl) 
+
+#긍정 부정 뉴스 csv 파일
+columns_pn = ['date', 'ticker', 'suggest_type', 'suggest_value']
+pn_total = pd.DataFrame(columns=columns_pn) 
+
+#산업별 시장 마켓 파일
+industrial_index = ['date', 'ticker', 'industry', 'indices','marketCap']
+industrial_total = pd.DataFrame(columns=industrial_index)
+
+############################################################
+#buffett_indicator csv파일
+buffett_columns = ['date','buffett_indicator'] #컬럼 생성
+buffett_total = pd.DataFrame(columns=buffett_columns)
+
+fred = Fred(api_key='e46409eff00e9d5d2f3be11cf58e3ee4 ')
+
+buffett_start_date = '2022-06-01'
+buffett_start_origin_data = '2000-01-01'
+
+GDP_quarterly = pd.DataFrame(fred.get_series('GDP',observation_start=buffett_start_date),columns=['GDP'])
+wilshire5000 = pd.DataFrame(fred.get_series('WILL5000PR',observation_start=buffett_start_date),columns=['Wilshire'])
+GDP_quarterly_all = pd.DataFrame(fred.get_series('GDP',observation_start=buffett_start_origin_data),columns=['GDP'])
+wilshire5000_all = pd.DataFrame(fred.get_series('WILL5000PR',observation_start=buffett_start_origin_data),columns=['Wilshire'])
+
+buffett_data = pd.merge(GDP_quarterly,wilshire5000,how='outer',left_index=True,right_index=True)
+buffett_data = buffett_data.fillna(method='ffill').dropna()
+buffett_data_all = pd.merge(GDP_quarterly_all,wilshire5000_all,how='outer',left_index=True,right_index=True)
+buffett_data_all = buffett_data_all.fillna(method='ffill').dropna()
+
+buffett_indicator = buffett_data['Wilshire']/buffett_data['GDP']*100
+buffett_indicator_all = buffett_data_all['Wilshire']/buffett_data_all['GDP']*100
+
+#당일 버핏 지수 csv파일로 저장
+buffett_total.loc[1] = [buffett_indicator.index[-1].date(),buffett_indicator.values[-1]]
+buffett_total.to_csv(f'C:/Users/tjtjd/Desktop/helpant/data/buffett_indicator/{datetime.today().strftime("%Y-%m-%d")} buffett_indicator.csv',index = None)
+
+#중접 버핏 지수
+buffett = pd.DataFrame(buffett_indicator_all)
+buffett['date'] = buffett.index
+buffett.columns=['buffett_indicator','date']
+buffett = buffett[['date','buffett_indicator']]
+buffett.to_csv(f'C:/Users/tjtjd/Desktop/helpant/data/buffett_indicator/{datetime.today().strftime("%Y-%m-%d")} buffett_indicator_all.csv',index = None)
+############################################################
+
+#환율 csv 파일
+exchange_columns = ['date','exchange_rate','yesterday_rate','indices'] #컬럼 생성
+exchange_rate_all = pd.DataFrame(columns=exchange_columns)
+
+ex = yf.download(['USDKRW=X'])
+
+yesterday_exchange_rate = round(float(ex['Close'].values[-2]),2) #어제 환율
+exchange_rate = round(float(ex['Close'].values[-1]),2) #오늘 환율
+indices = round((((exchange_rate - yesterday_exchange_rate) / yesterday_exchange_rate) * 100),2)
+
+#당일 환율 적용
+exchange_rate_all.loc[1] = [datetime.today().strftime("%Y-%m-%d"),exchange_rate,yesterday_exchange_rate,indices]
+exchange_rate_all.to_csv(f'C:/Users/tjtjd/Desktop/helpant/data/exchange_rate/{datetime.today().strftime("%Y-%m-%d")} exchange_rate.csv',index = None)
+
+#중첩 환율
+ex['Date'] = ex.index
+ex_all = ex[['Date','Close']]
+ex_all.to_csv(f'C:/Users/tjtjd/Desktop/helpant/data/exchange_rate/{datetime.today().strftime("%Y-%m-%d")} exchange_rate_all.csv',index = None)
+############################################################
+
+#나스닥, 다우, S&P 500
+ixic = yf.download('^IXIC', start='2000-01-01')
+snp = yf.download('^GSPC', start='2000-01-01')
+dji = yf.download('^DJI', start='2000-01-01')
+
+nasdac_market = ['date','ticker','close','yesterday_close','indices'] #컬럼 생성
+nasdac_market = pd.DataFrame(columns=nasdac_market)
+
+ixic_indices = round(((round(ixic['Close'].values[-1],2) - round(ixic['Close'].values[-2],2))  / round(ixic['Close'].values[-2]) * 100),2)
+snp_indices = round(((round(snp['Close'].values[-1],2) - round(snp['Close'].values[-2],2)) / round(snp['Close'].values[-2]) * 100),2)
+dji_indices = round(((round(dji['Close'].values[-1],2) - round(dji['Close'].values[-2],2)) / round(dji['Close'].values[-2]) * 100),2)
+
+#당일 개별 종목
+nasdac_market.loc[1] = [buffett_indicator.index[-1].date(),'ixic',round(ixic['Close'].values[-1],2),round(ixic['Close'].values[-2],2),ixic_indices]
+nasdac_market.loc[2] = [buffett_indicator.index[-1].date(),'snp',round(snp['Close'].values[-1],2),round(snp['Close'].values[-2],2),snp_indices]
+nasdac_market.loc[3] = [buffett_indicator.index[-1].date(),'dji',round(dji['Close'].values[-1],2),round(dji['Close'].values[-2],2),dji_indices]
+
+nasdac_market.to_csv(f'C:/Users/tjtjd/Desktop/helpant/data/nasdac_market/{datetime.today().strftime("%Y-%m-%d")} market_indices.csv',index = None)
+
+#전 모든 종목
+ixic['Date'] = ixic.index
+ixic['ticker'] = 'nasdaq'
+ixic = ixic[['Date','ticker','Close']]
+
+snp['Date'] = snp.index
+snp['ticker'] = 's&p500'
+snp = snp[['Date','ticker','Close']]
+
+dji['Date'] = dji.index
+dji['ticker'] = 'dji'
+dji = dji[['Date','ticker','Close']]
+
+ixic.to_csv(f'C:/Users/tjtjd/Desktop/helpant/data/nasdac_market/{datetime.today().strftime("%Y-%m-%d")} nasdac_market.csv',index = None)
+snp.to_csv(f'C:/Users/tjtjd/Desktop/helpant/data/nasdac_market/{datetime.today().strftime("%Y-%m-%d")} snp500_market.csv',index = None)
+dji.to_csv(f'C:/Users/tjtjd/Desktop/helpant/data/nasdac_market/{datetime.today().strftime("%Y-%m-%d")} dji_market.csv',index = None)
+
+######################################################
+for count in stock:
+    #초기화작업
+    order += 1
+    good_words_count = 0
+    bad_words_count = 0
+
+    BUY_count = 0
+    HOLD_count = 0
+    SELL_count = 0
+
+    key_word = count
+    keyword = listToString(key_word)
+
+    #애널리스트 정보
+    recommendation = (yf.Ticker(keyword).recommendations).loc['2022-01-01 00:00:00':] #올해 애널리스트 정보
+
+    for opinion in recommendation['To Grade'].values:
+        if(opinion in BUY): #매수의견
+            BUY_count += 1
+        if(opinion in HOLD): #중립의견
+            HOLD_count += 1
+        if(opinion in SELL): #매도의견
+            SELL_count += 1  
+
+    anlysit_count += 1
+    anylist_total.loc[anlysit_count] = [datetime.today().strftime("%Y-%m-%d"), keyword,'BUY',BUY_count]
+
+    anlysit_count += 1
+    anylist_total.loc[anlysit_count] = [datetime.today().strftime("%Y-%m-%d"), keyword,'HOLD',HOLD_count]
+
+    anlysit_count += 1
+    anylist_total.loc[anlysit_count] = [datetime.today().strftime("%Y-%m-%d"), keyword,'SELL',SELL_count]
+
+    #indices
+    day = str(datetime.today().strftime("%Y-%m-%d"))
+    total_data = yf.download(keyword ,start = '2022-08-01', end = day) #주가데이터 뽑을 꺼
+
+    a = round(float(total_data['Close'].tail(1).values),2) #오늘
+    b = round(float(total_data['Close'][-2:-1].values),2)  #전날
+
+    indices = round((((a-b) / b) * 100),2) #차이
+
+    #rsi (Momentum)
+    rsi_index = yf.download(keyword, start = '2021-08-01')   
+    rsi = ta.momentum.rsi(rsi_index['Close'],window=14)
+    rsi = round(rsi.values[-1], 3)  
+
+    #price
+    price = round(rsi_index['Close'].values[-1],2)
+
+    #marketcap
+    marketcap_ticker = yf.Ticker(keyword)
+    marketcap = marketcap_ticker.info['marketCap']
+
+    #산업별 마켓
+    industrial_total.loc[industrial_count+1] = [datetime.today().strftime("%Y-%m-%d"),keyword,industrial_indicator['Industry'][industrial_count],indices,marketcap]
+    industrial_count += 1
+
+    #avg_60  - 앞 데이터 이용
+    avg_data = rsi_index.tail(60)
+    avg_60 = round(numpy.mean(avg_data['Close']),2)
+
+    #Volume
+    volume = (rsi_index['Volume']).values[-1]
+
+    #CMF (Volume)
+    cmf = ta.volume.ChaikinMoneyFlowIndicator(rsi_index['High'],rsi_index['Low'],rsi_index['Close'],rsi_index['Volume']).chaikin_money_flow()
+    cmf = round(cmf[-1],3)
+
+    #MACD (Trend)
+    macd = round((ta.trend.MACD(rsi_index['Close']).macd_diff()).values[-1],7)
+
+    #ATR(Volatility)
+    ATR_data = ta.volatility.AverageTrueRange(rsi_index['High'],rsi_index['Low'],rsi_index['Close'],window=14).average_true_range()
+    a, b = ATR_data.values[-1], ATR_data.values[-25] #a가 현제 데이터
+
+    if(a <= b): #하락추세 = 안정적
+        atr = 0
+    else: #현재가 더 크면 상승추세 = 불안정
+        atr = 1
+
+    #CCI(Trend)
+    cci = ta.trend.CCIIndicator(rsi_index['High'],rsi_index['Low'],rsi_index['Close'],window=14).cci()
+    cci = round(cci[-1],5)  
+
+    driver.get(url)
+    driver.maximize_window()
+    time.sleep(2)
+
+    #검색창 활성
+    driver.find_element(By.CSS_SELECTOR, '#yfin-usr-qry').click() 
+    driver.find_element(By.CSS_SELECTOR, '#yfin-usr-qry').send_keys(f'{keyword}' + '\n')
+    time.sleep(2)
+
+    #스크롤 내리기 (야후 파이낸스의 경우 무한 스크롤 형태 이므로)
+    for c in range(0,9):
+        #driver.find_element_by_tag_name('body').send_keys(Keys.PAGE_DOWN)
+        driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.PAGE_DOWN)
+        time.sleep(2)
+        
+    req = driver.page_source
+
+    soup = BeautifulSoup(req, 'html.parser')
+    data_rows = soup.find_all('h3', attrs={'class':'Mb(5px)'})
+    print(len(data_rows))
+    time.sleep(2) 
+
+    #한바퀴 돌면 한 종목에 대한 모든 뉴스 저장 끝
+    for data_row in data_rows:
+        news_title_data = data_row.find('a').get_text() #영어제목
+        news_title_datas = news_title_data.split() #띄어쓰기 기준으로 단어 분리
+
+        for i in range(0, len(news_title_datas)):#긍정단어
+            if(news_title_datas[i] in good_word):
+                good_words_count += 1 
+
+        for i in range(0, len(news_title_datas)):#긍정단어
+            if(news_title_datas[i] in bad_word):
+                bad_words_count += 1 
+
+    pn_count += 1 #긍정부정
+    pn_total.loc[pn_count] = [datetime.today().strftime("%Y-%m-%d"), keyword,'Good_news',good_words_count]
+
+    pn_count += 1
+    pn_total.loc[pn_count] = [datetime.today().strftime("%Y-%m-%d"), keyword,'Bad_news',bad_words_count]
+
+    positive_rate = round((good_words_count / (good_words_count+bad_words_count) *100),2)
+    df_total.loc[order] = [datetime.today().strftime("%Y-%m-%d"), keyword, price, marketcap, indices, rsi, avg_60,volume, cmf, macd, cci, atr,
+        good_words_count, bad_words_count, positive_rate, BUY_count, HOLD_count, SELL_count]
+    
+#산업별 마켓
+industry_indices = round(industrial_total.groupby('industry')['indices'].mean(),2)
+industry_marketCap = industrial_total.groupby('industry')['marketCap'].sum()
+
+industry_market = pd.merge(industry_indices,industry_marketCap,on='industry')
+industry_market['industry'] = industry_market.index
+industry_market = industry_market[['indices','marketCap','industry']]
+
+industry_market.to_csv(f'C:/Users/tjtjd/Desktop/helpant/data/industrial/{datetime.today().strftime("%Y-%m-%d")} industrial_market.csv', encoding='euc-kr',index = None)
+anylist_total.to_csv(f'C:/Users/tjtjd/Desktop/helpant/data/anylist/{day} anylist.csv',index = None)
+pn_total.to_csv(f'C:/Users/tjtjd/Desktop/helpant/data/postive_rate/{day} positive_rate_count.csv',index = None)
+df_total.to_csv(f'C:/Users/tjtjd/Desktop/helpant/data/postive_rate/{day} positive_rate.csv',index = None)
+
+
+indicator_total = pd.read_csv(f'C:/Users/tjtjd/Desktop/helpant/data/postive_rate/{day} positive_rate.csv')
+#지표 계산
+#indicator_total = df_total
+indicator_total['rsi_score'] = indicator_total['rsi'].apply(lambda x: get_rsi_score(x))
+indicator_total['cmf_score'] = indicator_total.apply(lambda x: get_cmf_score(x['avg_60'],x['volume'],x['cmf'],x['rsi']), axis=1)
+indicator_total['macd_score'] = indicator_total.apply(lambda x: get_macd_score(x['macd'],x['cmf']), axis=1)
+indicator_total['cci_score'] = indicator_total['cci'].apply(lambda x: get_cci_score(x))
+indicator_total['atr_score'] = indicator_total['atr'].apply(lambda x: get_atr_score(x))
+indicator_total['word_score'] = indicator_total['good_words_count'].apply(lambda x: get_word_score(x))
+indicator_total['total_score'] = indicator_total['rsi_score']+indicator_total['cmf_score']+indicator_total['macd_score']+indicator_total['cci_score']+indicator_total['atr_score']
+
+scaler = MinMaxScaler() # 0~100단위로 변경
+indicator_total_score = indicator_total[['total_score']]
+
+indicator_total_scaled = scaler.fit_transform(indicator_total_score)
+
+indicator_total['scaled_score'] = np.round(indicator_total_scaled*85, 2)
+indicator_total['scaled_score'] = indicator_total['scaled_score'] +indicator_total['word_score']
+
+
+df_buffett = pd.read_csv(f'C:/Users/tjtjd/Desktop/helpant/data/buffett_indicator/{day} buffett_indicator.csv')
+#indicator_buffett = buffett_total #버핏점수 가져오기
+buffett_indicator = df_buffett['buffett_indicator'][0]
+
+buffett_score = get_buffett_indicator(buffett_indicator) #점수
+
+indicator_total['purchase_score'] = indicator_total['scaled_score']+ buffett_score
+
+indicator_total['purchase_mean_score'] = np.round(np.mean(indicator_total['purchase_score']),2)#평균 점수
+
+indicator_total.to_csv(f'C:/Users/tjtjd/Desktop/helpant/data/indicator/{day} indicator_total.csv',index = None)
